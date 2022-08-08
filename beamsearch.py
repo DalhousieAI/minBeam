@@ -2,7 +2,7 @@
 
 import torch
 import torch.nn as nn
-from einops import repeat, rearrange, reduce
+from einops import repeat, rearrange
 
 
 @torch.no_grad()
@@ -129,49 +129,69 @@ def beam(idx, model, max_new_tokens, beam_size, drop_tokens=None):
         batch_idx = repeat(
             torch.arange(b, device=idx.device), "b -> b beams", beams=beam_size
         )
-        # print(batch_idx.size(), beam_idx.size(), idx.size())
         idx = rearrange(idx, "(b beams) t -> b beams t", beams=beams)[
             batch_idx.reshape(-1), beam_idx.reshape(-1)
         ]
-        # print(idx.size())
-        # idx = rearrange(idx, 'b beams t -> (b beams) t', beams=beams, t=t)
         idx_next = rearrange(idx_next, "b beams -> (b beams) ()", beams=beam_size)
-        # append sampled index to the running sequence
+        # append indexes to the running sequence
         idx = torch.cat((idx, idx_next), dim=1)
         beams = beam_size
     idx = rearrange(idx, "(b beams) t -> b beams t", beams=beam_size)
     return idx, logp
 
 
-# reference algorithm for Stochastic Beam Search https://arxiv.org/abs/1903.06059
-# included in case I have time to code it
-# \begin{algorithm}[H]
-#   \centering
-#   \scriptsize
-#   \caption{StochasticBeamSearch($p_{\bm{\theta}}$, $k$)} \label{alg:stochastic_beam_search}
-#   \begin{algorithmic}[1]
-#   	  \STATE {\bfseries Input:} one-step probability distribution $p_{\bm{\theta}}$, beam/sample size $k$
-#   	  \STATE \textnormal{Initialize } \textsc{beam} empty
-#   	  \STATE add $(\bm{y}^N=\emptyset, \phi_N = 0, G_{\phi_N} = 0)$ to \textsc{beam}
-#   	  \FOR{$t = 1, \ldots, \text{steps}$}
-#   	    \STATE \textnormal{Initialize } \textsc{expansions} \textnormal{ empty}
-#   	    \FOR{$(\bm{y}^S, \phi_{S}, G_{\phi_{S}}) \in \textsc{beam}$}
-#   	        \STATE $Z \gets - \infty$
-#   	        \FOR {$S' \in \text{Children}(S)$}
-#   	            \STATE $\phi_{S'} \gets \phi_{S} + \log p_{\bm{\theta}}(\bm{y}^{S'} | \bm{y}^S)$
-#   	            \STATE $G_{\phi_{S'}} \sim \text{Gumbel}(\phi_{S'})$
-#   	            \STATE $Z \gets \max(Z, G_{\phi_{S'}})$
-#   	        \ENDFOR
-#   	        \FOR{$S' \in \text{Children}(S)$}
-#   	            \STATE $\tilde{G}_{\phi_{S'}} \gets - \log( \exp( - G_{\phi_S} ) - \exp ( - Z) + \exp ( - G_{\phi_{S'}}) )$
-#   	            \STATE add $(\bm{y}^{S'}, \phi_{S'}, \tilde{G}_{\phi_{S'}})$ to \textsc{expansions}
-#   	        \ENDFOR
-#   	    \ENDFOR
-#   	    \STATE \textsc{beam} ${} \gets \textnormal{take } \text{top $k$}$ of \textsc{expansions} according to $\tilde{G}$
-#   	  \ENDFOR
-#   	  \STATE Return \textsc{beam}
-#   \end{algorithmic}
-# \end{algorithm}
+@torch.no_grad()
+def shorter_beam(idx, model, max_new_tokens, beams, drop_tokens=None):
+    "Shorter implementation of beam search (I think it's more memory intensive)"
+    b = idx.size(0)
+    for new_token_idx in range(max_new_tokens):
+        t = idx.size(1)
+        # if the sequence context is growing too long we must crop it at block_size
+        idx_cond = (
+            idx if idx.size(1) <= model.block_size else idx[..., -model.block_size :]
+        )
+        # forward the model to get the logits for the index in the sequence
+        logits, _ = model(idx_cond)
+        logp_cond = logits[..., [-1], :]
+        if drop_tokens is not None:
+            logp_cond[:, drop_tokens] = -1e20
+        logp = (
+            logp_cond.view(b, beams, -1) + logp.view(b, beams, 1)
+            if new_token_idx > 0
+            else logp_cond
+        )
+        # enumerate all candidate beams
+        idx_next = torch.arange(model.vocab_size, device=idx.device)
+        _beams = beams if new_token_idx > 0 else 1
+        all_candidates = torch.cat(
+            [
+                repeat(
+                    idx,
+                    "(b beams) t -> b (beams v) t",
+                    beams=_beams,
+                    v=model.vocab_size,
+                    t=t,
+                ),
+                repeat(
+                    idx_next,
+                    "v -> b (beams v) ()",
+                    v=model.vocab_size,
+                    b=b,
+                    beams=_beams,
+                ),
+            ],
+            dim=2,
+        )
+        # select the most probable beams
+        logp, beam_idxs = torch.topk(
+            rearrange(
+                logp, "b beams v -> b (beams v)", beams=_beams, v=model.vocab_size
+            ),
+            k=beams,
+            dim=-1,
+        )
+        idx = torch.cat([x[i] for i, x in zip(beam_idxs, all_candidates)], dim=0)
+    return idx.view(b, beams, -1), logp
 
 
 class DummyModel(nn.Module):
@@ -203,12 +223,18 @@ if __name__ == "__main__":
     print(_a)  # should match greedy with one beam
     _b = beam(idx, model, max_new_tokens=3, beam_size=2)
     print(_b)
+    sa = shorter_beam(idx, model, max_new_tokens=3, beams=1)
+    sb = shorter_beam(idx, model, max_new_tokens=3, beams=2)
+    print(sb)
     assert torch.all(torch.eq(_a[0], a[0]))
     assert torch.all(torch.eq(_b[0], b[0]))
+    assert torch.all(torch.eq(a[0], sa[0]))
     err = torch.abs(_a[1] - a[1]).max()
     assert torch.allclose(_a[1], a[1]), (err, _a[1].size(), a[1].size())
     err = torch.abs(_b[1] - b[1]).max()
     assert torch.allclose(_b[1], b[1]), (err, _b[1].size(), b[1].size())
+    err = torch.abs(sa[1] - _a[1]).max()
+    assert torch.allclose(sa[1], _a[1]), (err, sa[1].size(), _a[1].size())
     model = DummyModel(4, 10)
     idx = torch.tensor([[0, 1, 2, 3], [0, 2, 1, 3]])
     x, logp = beam(idx, model, max_new_tokens=3, beam_size=1)
@@ -218,16 +244,22 @@ if __name__ == "__main__":
     import timeit
 
     model = DummyModel(4, 10)
-    N = 100
+    N = 32
     inefficient_time = timeit.timeit(
-        "inefficient_beam(idx, model, max_new_tokens=3, beam_size=1)",
+        "inefficient_beam(idx, model, max_new_tokens=10, beam_size=5)",
         globals=globals(),
         number=N,
     )
     efficient_time = timeit.timeit(
-        "beam(idx, model, max_new_tokens=3, beam_size=1)", globals=globals(), number=N
+        "beam(idx, model, max_new_tokens=10, beam_size=5)", globals=globals(), number=N
+    )
+    shorter_time = timeit.timeit(
+        "shorter_beam(idx, model, max_new_tokens=10, beams=5)",
+        globals=globals(),
+        number=N,
     )
     print("inefficient beam: ", inefficient_time / N)
     print("efficient beam:   ", efficient_time / N)
+    print("shorter beam:     ", shorter_time / N)
     assert inefficient_time > efficient_time
     # this improvement should get better for models that benefit from batched calls
